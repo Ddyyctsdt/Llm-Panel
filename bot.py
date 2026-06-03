@@ -4,7 +4,7 @@ import json
 import logging
 import requests
 import sys
-from typing import Optional, Generator
+from typing import Optional
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -14,7 +14,7 @@ API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN")
 NAMESPACE_ID = os.environ.get("KV_NAMESPACE_ID")
 
 if not ACCOUNT_ID or not API_TOKEN or not NAMESPACE_ID:
-    logger.error("Missing required environment variables: CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN, KV_NAMESPACE_ID")
+    logger.error("Missing required env: CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN, KV_NAMESPACE_ID")
     sys.exit(1)
 
 KV_API_BASE = f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/storage/kv/namespaces/{NAMESPACE_ID}/values"
@@ -32,7 +32,7 @@ def kv_get(key: str) -> Optional[str]:
             elif resp.status_code == 404:
                 return None
             else:
-                logger.warning(f"kv_get attempt {attempt+1} failed: {resp.status_code} {resp.text}")
+                logger.warning(f"kv_get attempt {attempt+1} failed: {resp.status_code}")
         except Exception as e:
             logger.warning(f"kv_get attempt {attempt+1} error: {e}")
         time.sleep(1)
@@ -47,7 +47,7 @@ def kv_put(key: str, value: str, expiration_ttl: Optional[int] = None) -> bool:
             if resp.status_code == 200:
                 return True
             else:
-                logger.warning(f"kv_put attempt {attempt+1} failed: {resp.status_code} {resp.text}")
+                logger.warning(f"kv_put attempt {attempt+1} failed: {resp.status_code}")
         except Exception as e:
             logger.warning(f"kv_put attempt {attempt+1} error: {e}")
         time.sleep(1)
@@ -57,9 +57,7 @@ def kv_delete(key: str) -> bool:
     for attempt in range(3):
         try:
             resp = requests.delete(f"{KV_API_BASE}/{key}", headers=HEADERS, timeout=10)
-            if resp.status_code == 200:
-                return True
-            elif resp.status_code == 404:
+            if resp.status_code in (200, 404):
                 return True
             else:
                 logger.warning(f"kv_delete attempt {attempt+1} failed: {resp.status_code}")
@@ -88,70 +86,50 @@ def load_model():
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
         logger.info("Model downloaded.")
-    logger.info("Loading model...")
-    llm = Llama(model_path=model_path, n_ctx=2048, n_threads=2, verbose=False)
+    logger.info("Loading model with chat_format=qwen...")
+    llm = Llama(
+        model_path=model_path,
+        n_ctx=2048,
+        n_threads=2,
+        verbose=False,
+        chat_format="qwen"
+    )
     logger.info("Model loaded.")
     return llm
 
-def call_model_stream(prompt: str, llm) -> Generator[str, None, None]:
-    try:
-        # بررسی پشتیبانی از stream
-        if hasattr(llm, 'create_completion') and 'stream' in llm.create_completion.__code__.co_varnames:
-            logger.info("Using real streaming mode")
-            stream = llm.create_completion(
-                prompt,
-                max_tokens=512,
-                temperature=0.7,
-                top_p=0.9,
-                stream=True,
-                stop=["<|im_end|>", "<|endoftext|>"]
-            )
-            for chunk in stream:
-                if 'choices' in chunk and len(chunk['choices']) > 0:
-                    delta = chunk['choices'][0].get('delta', {})
-                    if 'content' in delta:
-                        yield delta['content']
-                        time.sleep(0.2)
-        else:
-            logger.info("Using simulated streaming (full generation then split)")
-            response = llm.create_completion(
-                prompt,
-                max_tokens=512,
-                temperature=0.7,
-                top_p=0.9,
-                stop=["<|im_end|>", "<|endoftext|>"]
-            )
-            full_text = response['choices'][0]['text']
-            chunk_size = 10
-            for i in range(0, len(full_text), chunk_size):
-                yield full_text[i:i+chunk_size]
-                time.sleep(0.5)
-    except Exception as e:
-        logger.error(f"Model generation error: {e}")
-        yield f"\n[خطا در تولید: {e}]"
-
 def process_request(req_id: str, user_msg: str, llm) -> None:
     logger.info(f"Processing request {req_id}: {user_msg[:50]}...")
-    prompt = f"<|im_start|>user\n{user_msg}<|im_end|>\n<|im_start|>assistant\n"
+    messages = [{"role": "user", "content": user_msg}]
     start_time = time.time()
     try:
-        full_response = ""
-        for chunk in call_model_stream(prompt, llm):
+        stream = llm.create_chat_completion(
+            messages=messages,
+            max_tokens=512,
+            temperature=0.7,
+            top_p=0.9,
+            stream=True,
+            stop=["<|im_end|>", "<|endoftext|>"]
+        )
+        for chunk in stream:
             elapsed = time.time() - start_time
-            if elapsed > 300:  # 5 minutes
-                logger.error(f"Timeout for request {req_id} after {elapsed:.1f} seconds")
-                update_response(req_id, f"\n[خطا: زمان پاسخ بیش از 5 دقیقه شد]", is_done=False)
+            if elapsed > 300:
+                logger.error(f"Timeout for {req_id} after {elapsed:.1f}s")
+                update_response(req_id, "\n[خطا: زمان پاسخ بیش از 5 دقیقه شد]", is_done=False)
                 break
-            full_response += chunk
-            update_response(req_id, chunk, is_done=False)
+            if 'choices' in chunk and len(chunk['choices']) > 0:
+                delta = chunk['choices'][0].get('delta', {})
+                content = delta.get('content', '')
+                if content:
+                    update_response(req_id, content, is_done=False)
+        # پایان پاسخ (حتی اگر timeout شده باشد، DONE اضافه می‌شود)
         update_response(req_id, "", is_done=True)
-        logger.info(f"Finished request {req_id} (length: {len(full_response)} chars)")
+        logger.info(f"Finished request {req_id}")
     except Exception as e:
-        logger.error(f"Unexpected error processing {req_id}: {e}")
+        logger.error(f"Error processing {req_id}: {e}")
         update_response(req_id, f"\n[خطا: {str(e)}]", is_done=True)
 
 def main():
-    logger.info("Starting bot.py (fixed race condition + timeout)")
+    logger.info("Starting bot.py with create_chat_completion and qwen chat format")
     try:
         llm = load_model()
     except Exception as e:
@@ -168,17 +146,16 @@ def main():
                         req_id = queue_item.get("id")
                         user_msg = queue_item.get("message")
                         # حذف فوری صف برای جلوگیری از race condition
-                        deleted = kv_delete("queue:next")
-                        if not deleted:
-                            logger.warning("Could not delete queue:next, maybe already taken by another action? Skipping.")
-                        else:
-                            logger.info(f"Acquired and deleted queue item {req_id}, processing...")
+                        if kv_delete("queue:next"):
+                            logger.info(f"Acquired request {req_id}, processing...")
                             process_request(req_id, user_msg, llm)
+                        else:
+                            logger.warning("Could not delete queue:next, skipping")
                     else:
-                        logger.debug(f"Queue item status is {queue_item.get('status')}, ignoring")
-                        kv_delete("queue:next")  # پاک کردن کلید نامعتبر
+                        logger.debug(f"Queue item status {queue_item.get('status')} invalid, deleting")
+                        kv_delete("queue:next")
                 except json.JSONDecodeError:
-                    logger.error("Invalid JSON in queue:next, deleting it")
+                    logger.error("Invalid JSON in queue:next, deleting")
                     kv_delete("queue:next")
             else:
                 logger.debug("Queue empty, sleeping 3s")
