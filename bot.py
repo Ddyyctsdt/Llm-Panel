@@ -79,7 +79,7 @@ def load_model():
     model_path = "./model.gguf"
     if not os.path.exists(model_path):
         logger.info("Downloading model from Hugging Face...")
-        url = "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-UD-Q4_K_XL.gguf"
+        url = "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-UD-Q6_K_XL.gguf?download=true"
         response = requests.get(url, stream=True)
         response.raise_for_status()
         with open(model_path, "wb") as f:
